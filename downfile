@@ -1,0 +1,462 @@
+#ifndef DOWN_MUTI_THREDD
+#define DOWN_MUTI_THREDD
+
+#include "kcore.h"
+#include "SyncServer.h"
+#include <mutex>  
+#include <thread>
+#include <vector>
+#include <iostream>
+#include <windows.h>
+
+extern HANDLE ghAppExit;
+extern HANDLE gLogger;
+
+class DownFile
+{
+	static const DWORD FILE_BLOCK_SIZE = 0x8000;
+public: 
+	DownFile(DWORD IsRelative_, std::wstring szFileName_srv_, std::wstring writefilename_, GameTask* pTask_, int reporttype_)
+	{
+		hFile = NULL;
+		IsRelative= IsRelative_;
+		szFileName_srv = szFileName_srv_;
+		dwFileSize = 0;
+		pTask = pTask_;
+		writefilename = writefilename_;				
+		lastsend = 0;
+		lastdownblock = 0;
+		threadpool = AfxGetSysLong(TEXT("SYSTEM"), TEXT("idxthreadpool"), 1);
+		reporttype = reporttype_;
+		seterr(-1, TEXT("init"));
+	}
+	int geterr(wchar_t * msg)
+	{
+		wcscpy(msg, errmsg);
+		AfxWriteLogger(gLogger, TEXT("geterr ret %d,%s"), errcode, errmsg);
+		return errcode;
+	}
+	void seterr(int err,wchar_t* msg)
+	{
+		std::unique_lock<std::mutex> lck(mtx_seterr);
+		errcode = err;		
+		wmemset(errmsg, 0, 1024);
+		wcscpy(errmsg, msg);
+	}
+	int  queryfileattr()
+	{
+		wchar_t szErrInfo[1024];
+		int dwSize = 1024;
+		SOCKET sckServer = INVALID_SOCKET;
+
+		DWORD nPort = AfxGetSysLong(TEXT("SYSTEM"), TEXT("SERVERPORT"), DEFAULT_SERVER_PORT);
+		DWORD nTimeOut = AfxGetSysLong(TEXT("SYSTEM"), TEXT("CONNTIMEOUT"), DEFAULT_TCP_TIMEOUT);
+		int i = 4;
+		bool queryok = false;
+		while (--i)
+		{
+			if ((sckServer = AfxSocketConnect(pTask->szServerIp, (WORD)nPort, nTimeOut)) == INVALID_SOCKET)
+			{
+				_stprintf_s(szErrInfo, dwSize - 1, TEXT("连接服务器失败 %d times."), 4 - i);
+				AfxWriteLogger(gLogger, szErrInfo);
+				if (WAIT_OBJECT_0 == WaitForSingleObject(pTask->hStopTask, 3000))
+				{
+					swprintf_s(szErrInfo, dwSize - 1, TEXT("任务被取消 %s,%s"), pTask->szTaskId, pTask->szTaskName);
+					SendLogToServerErr(pTask->szServerIp, szErrInfo);
+					return -1;;
+				}
+				continue;
+
+
+			}
+
+			//query index file attributes.
+			char szSendBuffer[PKG_MAXLENGTH] = { 0 }, szRecvBuffer[PKG_MAXLENGTH] = { 0 };
+			CPkgHelper pkgSend(szSendBuffer, PKG_CMD_QUERY_FILE_ATTRIBUTE, 0);
+			pkgSend << IsRelative << szFileName_srv.c_str();
+			if (ERROR_SUCCESS != AfxSocketExecute(sckServer, szSendBuffer, pkgSend.GetLength(), szRecvBuffer, _countof(szRecvBuffer)))
+			{
+				_stprintf_s(szErrInfo, dwSize - 1, TEXT("取文件%s信息失败sokectexecute."), szFileName_srv.c_str());
+				AfxWriteLogger(gLogger, szErrInfo);
+				seterr(-1, szErrInfo);
+				AfxSocketClose(sckServer);
+				continue;
+			}
+			CPkgHelper pkgRecv(szRecvBuffer);
+			if (!pkgRecv.IsStatusOk())
+			{
+				TCHAR szErrText[1024] = { 0 };
+				pkgRecv >> szErrText;
+				_stprintf_s(szErrInfo, dwSize - 1, TEXT("取文件%s信息失败isstatusok :%s"), szFileName_srv.c_str(), szErrText);
+				seterr(-1, szErrInfo);
+				AfxWriteLogger(gLogger, szErrInfo);
+				AfxSocketClose(sckServer);
+				continue;
+			}
+			if (pkgRecv.IsStatusOk())
+			{
+				pkgRecv >> dwFileSize >> dwFileModifyTime >> dwFileCreateTime>>md5;
+				AfxSocketClose(sckServer);
+				queryok = true;
+				break;
+			}
+
+			if (WAIT_OBJECT_0 == WaitForSingleObject(ghAppExit, 0))
+			{
+				AfxSocketClose(sckServer);
+				return -1;
+			}
+			if (WAIT_OBJECT_0 == WaitForSingleObject(pTask->hStopTask, 3000))
+			{
+				swprintf_s(szErrInfo, dwSize - 1, TEXT("任务被取消 %s,%s"), pTask->szTaskId, pTask->szTaskName);
+				SendLogToServerErr(pTask->szServerIp, szErrInfo);
+				AfxSocketClose(sckServer);
+				return -1;
+			}
+
+		}
+		if (queryok)
+			return 0;
+		return -1;
+
+	}
+
+	int inittask()
+	{
+		block_vector.clear();
+		DWORD  blockcount = dwFileSize % FILE_BLOCK_SIZE;
+		if (blockcount != 0)
+			blockcount = dwFileSize / FILE_BLOCK_SIZE + 1;
+		else
+			blockcount = dwFileSize / FILE_BLOCK_SIZE;
+		block_vector.resize(blockcount);
+		DWORD bcount = 0;
+		while (true)
+		{
+			block_vector[bcount].start = bcount*FILE_BLOCK_SIZE;
+			if (bcount + 1 == blockcount)
+			{
+				block_vector[bcount].size = dwFileSize - (bcount)* FILE_BLOCK_SIZE;
+				break;
+			}
+			else
+				block_vector[bcount].size = FILE_BLOCK_SIZE;
+			bcount++;
+
+		}
+		totalblock = blockcount;
+		hFile = CreateFile(writefilename.c_str(), GENERIC_WRITE | GENERIC_READ, 0, NULL, CREATE_ALWAYS, FILE_FLAG_OVERLAPPED, NULL);
+		if (hFile == INVALID_HANDLE_VALUE)
+		{
+			DWORD err = GetLastError();
+			wchar_t szErrInfo[1024] = { 0 };
+			int dwSize = 1024;
+			swprintf_s(szErrInfo, dwSize - 1, TEXT("创建文件%s失败:errno %d"), writefilename.c_str(), err);
+			SendLogToServerErr(pTask->szServerIp, szErrInfo);
+			seterr(err, szErrInfo);
+			return  err;
+		}
+		
+		for (int i = 0; i < threadpool; i++)
+		{
+			std::thread* th=new std::thread(&DownFile::downblock, this);
+			thread_vector.push_back(th);
+		}
+		return 0;
+	}
+	int join()
+	{
+		for (UINT i = 0; i < thread_vector.size(); i++)
+		{
+			thread_vector[i]->join(); 
+			delete thread_vector[i];
+			continue;
+		}
+		if (hFile)
+		{
+			if (errcode == 0)
+			{			
+				BOOL sret = FALSE;
+				sret=SetFilePointer(hFile, dwFileSize, 0, FILE_BEGIN);
+				sret = SetEndOfFile(hFile);
+				if (!sret)
+				{
+					seterr(GetLastError(), TEXT("SetEndOfFile faile"));
+					CloseHandle(hFile);
+					return -1;
+				}			
+
+				FILETIME ctime = { 0 };
+				FILETIME mtime = { 0 };
+				AfxUtcTime2FileTime(dwFileCreateTime, ctime);
+				AfxUtcTime2FileTime(dwFileModifyTime, mtime);
+				sret = ::SetFileTime(hFile, &ctime, &mtime, &mtime);			
+				if (!sret)
+				{
+					seterr(GetLastError(), TEXT("修改时间失败"));		
+					CloseHandle(hFile);
+					return -1;
+				}
+				if (reporttype == SYNC_STEP_I_DOWN_DNA)
+				{
+					HANDLE hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+					if (hEvent == NULL)
+					{
+						seterr(GetLastError(), TEXT("readfile CreateEvent faile"));
+						return GetLastError();
+					}
+								
+					char* readbuf = new char[dwFileSize];
+					DWORD dwReadBytes = 0;
+					OVERLAPPED ov = { 0 };
+					ov.hEvent = hEvent;
+					ov.Offset = 0;
+					if (!ReadFile(hFile, readbuf, dwFileSize, &dwReadBytes, &ov) && ERROR_IO_PENDING != GetLastError())
+					{
+						DWORD err = GetLastError();
+						seterr(err, TEXT("ReadFile faile"));
+						delete readbuf;
+						CloseHandle(hEvent);
+						return err;
+					}
+					if (!GetOverlappedResult(hFile, &ov, &dwReadBytes, TRUE) || dwReadBytes != dwFileSize)
+					{
+						DWORD err = GetLastError();
+						seterr(err, TEXT("GetOverlappedResult faile"));
+						delete readbuf;
+						CloseHandle(hEvent);
+						return err;
+					}
+					CloseHandle(hEvent);
+
+					pTask->szTaskSeed = SysAllocStringByteLen(NULL, dwFileSize);
+					char* pData = (char*)pTask->szTaskSeed;					
+					CopyMemory(pData, readbuf, dwFileSize);
+					delete readbuf;
+
+				}
+				CloseHandle(hFile);			
+				if (AfxGetSysLong(TEXT("SYSTEM"), TEXT("ENABLEMD5"),0))
+				{
+					wchar_t md5_recv[64] = { 0 };
+					AfxGetFileMd5(writefilename.c_str(), md5_recv);
+					if (GetLastError() != 0 || memcmp(md5, md5_recv, 32) != 0)
+					{
+						wchar_t md5err[1024] = { 0 };
+						swprintf_s(md5err, 1024 - 1, TEXT("memcmp md5:remote:%s,local:%s,errno %d"), md5, md5_recv, GetLastError());
+						AfxWriteLogger(gLogger, md5err);
+						seterr(GetLastError(), md5err);
+						return -1;
+					}
+				}
+				seterr(0, TEXT("ok"));
+
+			}
+			else
+			CloseHandle(hFile);			
+		}
+		return 0;
+	}
+
+	int downblock()
+	{		
+		SOCKET sckServer = INVALID_SOCKET;
+		UINT errtims = 0;
+		UINT comerr = 0;
+		while (true)
+		{
+			bool bRet = false;				
+			DWORD nPort = AfxGetSysLong(TEXT("SYSTEM"), TEXT("SERVERPORT"), DEFAULT_SERVER_PORT);
+			DWORD nTimeOut = AfxGetSysLong(TEXT("SYSTEM"), TEXT("CONNTIMEOUT"), DEFAULT_TCP_TIMEOUT);
+			if ((sckServer = AfxSocketConnect(pTask->szServerIp, (WORD)nPort, nTimeOut)) == INVALID_SOCKET)
+			{		
+				wchar_t szErrInfo[1024] = { 0 };
+				int dwSize = 1024;
+				if (WAIT_OBJECT_0 == WaitForSingleObject(ghAppExit, 0))
+				{		
+					seterr(-1, TEXT("exit"));
+					return -1;
+				}
+				if (WAIT_OBJECT_0 == WaitForSingleObject(pTask->hStopTask, 3000))
+				{
+					swprintf_s(szErrInfo, dwSize - 1, TEXT("任务被取消 %s,%s"), pTask->szTaskId, pTask->szTaskName);
+					SendLogToServerErr(pTask->szServerIp, szErrInfo);
+					seterr(-1, szErrInfo);
+					return -2;
+				}
+				errtims++;
+				if (errtims >= 12)
+				{
+					swprintf_s(szErrInfo, dwSize - 1, TEXT("1 min 创建socket连接失败 %s,%d"), pTask->szServerIp, GetLastError());
+					SendLogToServerErr(pTask->szServerIp, szErrInfo);
+					seterr(-3, szErrInfo);
+					return -3;
+				}
+				continue;
+			}	
+			errtims = 0;
+			while (true)
+			{
+				wchar_t szErrInfo[1024] = { 0 };
+				int dwSize = 1024;
+				UINT maxcount= AfxGetSysLong(TEXT("SYSTEM"), TEXT("commcount"), 10);
+				if (comerr > maxcount)
+				{
+					swprintf_s(szErrInfo, dwSize - 1, TEXT("重试%d次,无一次通信成功 %s,%s"), maxcount,pTask->szTaskId, pTask->szTaskName);
+					SendLogToServerErr(pTask->szServerIp, szErrInfo);
+					AfxSocketClose(sckServer);
+					seterr(-1, szErrInfo);
+					return -1;
+				}
+			
+
+				block down = { 0, 0 };
+				{
+					seterr(-1, TEXT("no finish"));
+					std::unique_lock<std::mutex> lck(mtx);
+					if (block_vector.empty())
+					{
+						seterr(0, TEXT("ok"));
+						AfxSocketClose(sckServer);
+						return 0;
+					}
+						down = block_vector.front();
+					block_vector.erase(block_vector.begin());
+				}
+
+				if (WAIT_OBJECT_0 == WaitForSingleObject(pTask->hStopTask, 0))
+				{
+					AfxSocketClose(sckServer);
+					swprintf_s(szErrInfo, dwSize - 1, TEXT("任务被取消 %s,%s"), pTask->szTaskId, pTask->szTaskName);
+					SendLogToServerErr(pTask->szServerIp, szErrInfo);
+					seterr(-1, szErrInfo);
+					return -1;
+				}
+				if (WAIT_OBJECT_0 == WaitForSingleObject(ghAppExit, 0))
+				{
+					AfxSocketClose(sckServer);
+					seterr(-1, TEXT("exit"));
+					return -1;
+				}
+
+				char szSendBuffer[PKG_MAXLENGTH] = { 0 }, szRecvBuffer[PKG_MAXLENGTH] = { 0 };
+				CPkgHelper pkgSend(szSendBuffer, PKG_CMD_DOWN_FILE_BLOCK, 0);
+				pkgSend << IsRelative << szFileName_srv.c_str() << down.start << down.size;
+				if (ERROR_SUCCESS != AfxSocketExecute(sckServer, szSendBuffer, pkgSend.GetLength(), szRecvBuffer, sizeof(szRecvBuffer)))
+				{
+					comerr++;
+					swprintf_s(szErrInfo, dwSize - 1, TEXT("下载文件%s通信失败."), pTask->szTaskName);
+					SendLogToServer(pTask->szServerIp, szErrInfo);
+					seterr(-1, szErrInfo);
+					AfxSocketClose(sckServer);
+					std::unique_lock<std::mutex> lck(mtx);				
+					block_vector.push_back(down);				
+					break;
+				}
+				CPkgHelper pkgRecv(szRecvBuffer);
+				if (!pkgRecv.IsStatusOk())
+				{
+					comerr++;
+					wchar_t recv[1024] = { 0 };
+					pkgRecv >> recv;
+					swprintf_s(szErrInfo, dwSize - 1, TEXT("下载文件%s接收数据有误.%s"), pTask->szTaskName,recv);
+					SendLogToServer(pTask->szServerIp, szErrInfo);
+					AfxSocketClose(sckServer);
+					seterr(pkgRecv.GetHeader()->status, szErrInfo);
+					std::unique_lock<std::mutex> lck(mtx);
+					block_vector.push_back(down);
+					break;
+				}
+				comerr = 0;
+			HANDLE hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+			if (hEvent == NULL)
+			{
+				seterr(GetLastError(), TEXT("CreateEvent faile"));
+				return GetLastError();
+			}
+
+			DWORD dwReadBytes = 0;
+			OVERLAPPED ov = { 0 };
+			ov.hEvent = hEvent;
+			ov.Offset = down.start;
+			if (!WriteFile(hFile, (LPSTR)pkgRecv.GetBuffer() + sizeof(PkgHeader), down.size, &dwReadBytes, &ov) && ERROR_IO_PENDING != GetLastError())
+			{
+				DWORD  err = GetLastError();
+				seterr(err, TEXT("WriteFile faile"));				
+				CloseHandle(hEvent);
+				return err;
+			}
+			if (!GetOverlappedResult(hFile, &ov, &dwReadBytes, TRUE) || dwReadBytes != down.size)
+			{
+				DWORD  err = GetLastError();
+				seterr(err, TEXT("GetOverlappedResult faile"));
+				CloseHandle(hEvent);
+				return err;
+			}			
+			CloseHandle(hEvent);
+			{
+				std::unique_lock<std::mutex> lck(mtx_send); 
+				UINT timeduring = (GetTickCount() - lastsend)/1000;
+				if (timeduring>1)
+				{					
+					DWORD speed = (totalblock - block_vector.size() - lastdownblock)*FILE_BLOCK_SIZE / timeduring;
+					lastdownblock = totalblock - block_vector.size();
+					lastsend = GetTickCount();
+					SendSyncPrgInfo(pTask->szServerIp, reporttype, pTask->szTaskName, lastdownblock * 100 / totalblock, (DWORD)speed, (DWORD)0);
+				}
+			}
+		}
+
+		}
+	}
+private:
+
+	
+	DWORD IsRelative;
+	std::wstring szFileName_srv;
+	DWORD dwFileSize;
+	DWORD dwFileCreateTime;
+	wchar_t md5[64];
+	DWORD dwFileModifyTime;
+
+	struct block
+	{
+		DWORD start;
+		DWORD size;
+	};
+
+	int threadpool;
+	std::vector<std::thread*> thread_vector;
+	
+	std::mutex mtx;
+	std::vector<block> block_vector;
+
+
+	DWORD totalblock;
+	DWORD lastdownblock;
+
+	GameTask* pTask;
+	HANDLE hFile;
+	std::wstring writefilename;
+
+	std::mutex mtx_send;
+	UINT lastsend;
+
+
+	std::mutex mtx_seterr;
+
+
+	int errcode;
+	wchar_t errmsg[1024];
+
+	int reporttype;
+
+	
+
+
+};
+
+
+
+
+#endif
